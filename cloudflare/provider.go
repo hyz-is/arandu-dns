@@ -54,6 +54,8 @@ type Provider struct {
 var (
 	_ dns.Provider   = (*Provider)(nil)
 	_ dns.ZoneFinder = (*Provider)(nil)
+	_ dns.Remover    = (*Provider)(nil)
+	_ dns.Lister     = (*Provider)(nil)
 )
 
 // Option configures a Provider.
@@ -221,6 +223,32 @@ func (p *Provider) Update(ctx context.Context, zone dns.Zone, id string, record 
 		return dns.Record{}, err
 	}
 	return fromAPI(updated), nil
+}
+
+// Delete implements dns.Remover. It removes the record with that ID.
+func (p *Provider) Delete(ctx context.Context, zone dns.Zone, id string) error {
+	if id == "" {
+		return errors.New("cloudflare: a removal needs the record's ID")
+	}
+	_, err := p.do(ctx, http.MethodDelete, "/zones/"+url.PathEscape(zone.ID)+"/dns_records/"+url.PathEscape(id), nil, nil, nil)
+	return err
+}
+
+// RecordsUnder implements dns.Lister. It asks for the names that end in name
+// and keeps the ones that are name or a label sequence under it.
+func (p *Provider) RecordsUnder(ctx context.Context, zone dns.Zone, name string) ([]dns.Record, error) {
+	name = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+	found, err := p.listRecords(ctx, zone, url.Values{"name.endswith": {name}})
+	if err != nil {
+		return nil, err
+	}
+	var out []dns.Record
+	for _, r := range found {
+		if r.Name == name || strings.HasSuffix(r.Name, "."+name) {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }
 
 func fromAPI(r apiRecord) dns.Record {

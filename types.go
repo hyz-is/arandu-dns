@@ -67,11 +67,20 @@ type Want struct {
 	// MX or SPF record at the apex, or the DMARC policy at _dmarc. Without it
 	// the difference is a Conflict and nothing is touched.
 	Replace bool
+	// Takeover says the name is the caller's: whatever else holds it with
+	// other data is replaced by this record instead of being a Conflict. A CNAME
+	// the name cannot share, a different record of the same kind, several that
+	// could be the one to change: they are removed and this record takes their
+	// place, and the plan says so first (ActionReplace). Records at other names
+	// are never touched, and a protected record still needs Replace.
+	Takeover bool
 }
 
 // Provider is a DNS host reached with one credential.
 //
-// It has no Delete on purpose. An implementation reads and writes only what it
+// It has no Delete on purpose: a provider that can remove records says so by
+// also implementing Remover, and only a plan item that was confirmed as a
+// replacement ever calls it. An implementation reads and writes only what it
 // is asked for and never lists secrets in an error.
 type Provider interface {
 	// Name is the provider's short identifier, such as "cloudflare".
@@ -87,6 +96,22 @@ type Provider interface {
 	// Update replaces the record with that ID and answers it as the provider
 	// now holds it.
 	Update(ctx context.Context, zone Zone, id string, record Record) (Record, error)
+}
+
+// Remover is the optional interface of a provider that can remove a record. Apply
+// calls it only for an item the plan decided as ActionReplace, only for the
+// records the plan listed at that item's own name.
+type Remover interface {
+	// Delete removes the record with that ID.
+	Delete(ctx context.Context, zone Zone, id string) error
+}
+
+// Lister is the optional interface of a provider that can list the records at
+// a name and below it, which Neighbours uses to show what else the zone holds
+// next to the wanted records.
+type Lister interface {
+	// RecordsUnder lists the records whose name is name or ends in "." and name.
+	RecordsUnder(ctx context.Context, zone Zone, name string) ([]Record, error)
 }
 
 // The errors a provider and a plan answer with. Wrap them with %w and test them
@@ -105,6 +130,9 @@ var (
 	ErrRecordExists = errors.New("dns: the record already exists")
 	// ErrInvalid is a Want that cannot be applied as written.
 	ErrInvalid = errors.New("dns: invalid record")
+	// ErrCannotRemove is a replacement the provider cannot make because it does
+	// not implement Remover.
+	ErrCannotRemove = errors.New("dns: the provider cannot remove records")
 	// ErrPlanChanged is an Apply that found the zone different from the plan
 	// the person confirmed.
 	ErrPlanChanged = errors.New("dns: the zone changed since the plan was made")

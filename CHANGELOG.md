@@ -10,6 +10,33 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-21
+
+### Added
+
+- `Want.Takeover`: the name is the caller's. What else holds it with other data
+  is replaced instead of being a `Conflict`: a CNAME and other records that
+  cannot share the name (either way), several records that could be the one to
+  change, other MX records at a wanted MX name. One record of the same kind is
+  still an `update` in place. A protected apex record still needs `Want.Replace`.
+- `ActionReplace` and `OutcomeReplaced`. A replace item lists in `Item.Current`
+  the records that will be removed, so the person sees them before confirming;
+  `Plan.Pending` counts it. `Result.Removed` says what was removed and
+  `Result.Restored` that a failed create put it back.
+- `Remover`, the optional interface of a provider that can remove a record, and
+  `ErrCannotRemove`. `Provider` itself still has no `Delete`.
+- `Lister` and `Neighbours`: the records at and under a name that look like
+  another sending service's (an MX or SPF at the name, DKIM keys, return-path
+  aliases such as `send` and `rsend`), outside the plan, for a screen to show.
+  It only reads.
+- `cloudflare`: `Provider.Delete` and `Provider.RecordsUnder` (the `name.endswith`
+  filter).
+- `dnstest`: `Fake.Delete`, `Fake.RecordsUnder` and `Fake.NoDelete`; `Writes`
+  counts deletes.
+
+### Changed
+
+- Without `Takeover` nothing changes: every plan decides as in 0.1.0.
 
 ## [0.1.0] - 2026-11-20
 

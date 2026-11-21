@@ -28,8 +28,9 @@ Never `replace` it to a local checkout.
 2. The application builds a `dns.Provider` from the credential, finds the zone
    with `dns.FindZone`, and makes the plan with `dns.NewPlan` from the records
    the domain needs as `[]dns.Want`.
-3. It shows the plan: each item is `create`, `update`, `exists` or `conflict`,
-   with `Current` (what is there now) and, for a conflict, a `Code` to translate
+3. It shows the plan: each item is `create`, `update`, `replace`, `exists` or
+   `conflict`, with `Current` (what is there now, and for a `replace` what will be
+   removed) and, for a conflict, a `Code` to translate
    (`cname_exclusive`, `other_records`, `apex_protected`, `ambiguous`).
 4. The person confirms. The application calls `dns.Apply(ctx, provider, plan)`.
    `errors.As(err, &changed)` for `*dns.PlanChangedError` means the zone moved on:
@@ -39,7 +40,10 @@ Never `replace` it to a local checkout.
 ## Rules that are not negotiable
 
 - **Never delete, never overwrite what was not asked.** The `Provider` has no
-  delete. Do not add one to a provider of your own.
+  delete. Removal is the optional `Remover`, used by `Apply` for a `replace` item
+  of a `Want` with `Takeover`, at that item's own name, after the person saw it
+  in the plan. Set `Takeover` only on names that are the service's own (its
+  return path, its DKIM selector), never on the apex.
 - **The apex is the customer's.** MX, SPF and the DMARC policy at the apex are
   `Conflict`s. `Want.Replace` is only for a person who read the conflict and
   chose to replace; never set it for them.

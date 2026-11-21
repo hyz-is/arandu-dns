@@ -11,7 +11,8 @@ import (
 
 // Call is one call the fake received.
 type Call struct {
-	// Method is "Zones", "Records", "Create" or "Update".
+	// Method is "Zones", "Records", "RecordsUnder", "Create", "Update" or
+	// "Delete".
 	Method string
 	Zone   string
 	// Names are the names asked for in a Records call.
@@ -31,11 +32,18 @@ type Fake struct {
 
 	// Err, when set, is answered by every call until it is cleared.
 	Err error
+	// NoDelete, when true, makes Delete fail as a provider that refuses
+	// removals would.
+	NoDelete bool
 	// FailCreate, when set, is answered by Create for a record at that name.
 	FailCreate map[string]error
 }
 
-var _ dns.Provider = (*Fake)(nil)
+var (
+	_ dns.Provider = (*Fake)(nil)
+	_ dns.Remover  = (*Fake)(nil)
+	_ dns.Lister   = (*Fake)(nil)
+)
 
 // New returns a fake that hosts the zones.
 func New(zones ...dns.Zone) *Fake {
@@ -77,11 +85,11 @@ func (f *Fake) Calls() []Call {
 	return append([]Call(nil), f.calls...)
 }
 
-// Writes counts the Create and Update calls received.
+// Writes counts the Create, Update and Delete calls received.
 func (f *Fake) Writes() int {
 	n := 0
 	for _, c := range f.Calls() {
-		if c.Method == "Create" || c.Method == "Update" {
+		if c.Method == "Create" || c.Method == "Update" || c.Method == "Delete" {
 			n++
 		}
 	}
@@ -163,4 +171,42 @@ func (f *Fake) Update(_ context.Context, zone dns.Zone, id string, record dns.Re
 		}
 	}
 	return dns.Record{}, &dns.ProviderError{Provider: "fake", Status: 404, Messages: []string{"record not found"}}
+}
+
+// RecordsUnder implements dns.Lister.
+func (f *Fake) RecordsUnder(_ context.Context, zone dns.Zone, name string) ([]dns.Record, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, Call{Method: "RecordsUnder", Zone: zone.ID, Names: []string{name}})
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	var out []dns.Record
+	for _, r := range f.records[zone.ID] {
+		if r.Name == name || strings.HasSuffix(r.Name, "."+name) {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// Delete implements dns.Remover.
+func (f *Fake) Delete(_ context.Context, zone dns.Zone, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, Call{Method: "Delete", Zone: zone.ID, ID: id})
+	if f.Err != nil {
+		return f.Err
+	}
+	if f.NoDelete {
+		return &dns.ProviderError{Provider: "fake", Status: 403, Messages: []string{"removal refused"}, Err: dns.ErrForbidden}
+	}
+	for i, r := range f.records[zone.ID] {
+		if r.ID == id {
+			f.records[zone.ID] = append(f.records[zone.ID][:i:i], f.records[zone.ID][i+1:]...)
+			return nil
+		}
+	}
+	return &dns.ProviderError{Provider: "fake", Status: 404, Messages: []string{"record not found"}}
 }

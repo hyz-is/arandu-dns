@@ -3,6 +3,7 @@ package dns_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	dns "github.com/hyz-is/arandu-dns"
@@ -164,10 +165,10 @@ func TestNothingThePlanDidNotNameIsEverWritten(t *testing.T) {
 
 func TestTheProviderInterfaceCannotDelete(t *testing.T) {
 	t.Parallel()
-	var p dns.Provider = dnstest.New(zone)
-	if _, can := p.(interface {
-		Delete(context.Context, dns.Zone, string) error
-	}); can {
-		t.Error("the fake can delete; no provider in this module may")
+	provider := reflect.TypeOf((*dns.Provider)(nil)).Elem()
+	for i := 0; i < provider.NumMethod(); i++ {
+		if provider.Method(i).Name == "Delete" {
+			t.Error("dns.Provider has a Delete; removal is the optional dns.Remover, called only for a confirmed replacement")
+		}
 	}
 }

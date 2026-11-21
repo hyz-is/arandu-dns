@@ -19,6 +19,10 @@ const (
 	// ActionUpdate: the same record is there with another value, and would be
 	// changed to the wanted one.
 	ActionUpdate Action = "update"
+	// ActionReplace: records of another kind or with other data hold the name,
+	// and would be removed so that the wanted record takes their place. Only a
+	// Want with Takeover gets this; Item.Current lists what would be removed.
+	ActionReplace Action = "replace"
 	// ActionExists: the record is already there as wanted.
 	ActionExists Action = "exists"
 	// ActionConflict: something is there that the plan will not touch. The
@@ -48,8 +52,9 @@ type Item struct {
 	Want   Record
 	Action Action
 	// Current are the existing records that matter: the one that is already
-	// right (Exists), the one that would change (Update) or the ones in the way
-	// (Conflict). It is empty on a Create.
+	// right (Exists), the one that would change (Update), the ones that would
+	// be removed (Replace) or the ones in the way (Conflict). It is empty on a
+	// Create.
 	Current []Record
 	// Code and Reason say why an item is a Conflict.
 	Code   string
@@ -81,7 +86,9 @@ func (p Plan) Count(action Action) int {
 func (p Plan) HasConflicts() bool { return p.Count(ActionConflict) > 0 }
 
 // Pending reports whether applying the plan would write anything.
-func (p Plan) Pending() bool { return p.Count(ActionCreate)+p.Count(ActionUpdate) > 0 }
+func (p Plan) Pending() bool {
+	return p.Count(ActionCreate)+p.Count(ActionUpdate)+p.Count(ActionReplace) > 0
+}
 
 // Fingerprint identifies what the plan decides, so that a plan the person
 // confirmed can be compared with the one made at the moment of applying.
@@ -137,7 +144,7 @@ func NewPlan(ctx context.Context, provider Provider, zone Zone, wants ...Want) (
 
 	plan := Plan{Zone: zone, Wants: append([]Want(nil), wants...)}
 	for i, want := range wants {
-		plan.Items = append(plan.Items, decide(zone, resolved[i], want.Replace, byName[resolved[i].Name]))
+		plan.Items = append(plan.Items, decide(zone, resolved[i], want.Replace, want.Takeover, byName[resolved[i].Name]))
 	}
 	return plan, nil
 }
@@ -198,12 +205,19 @@ func protected(zone Zone, want Record) bool {
 
 // decide is the rule of the package: what to do about one wanted record, given
 // the records that exist at its name.
-func decide(zone Zone, want Record, replace bool, at []Record) Item {
+func decide(zone Zone, want Record, replace, takeover bool, at []Record) Item {
 	item := Item{Want: want, Replace: replace}
 	conflict := func(code, reason string, current []Record) Item {
 		item.Action, item.Code, item.Reason, item.Current = ActionConflict, code, reason, current
 		return item
 	}
+	// supersede is the answer when the name is the caller's: what is in the way
+	// goes, and the wanted record takes its place.
+	supersede := func(current []Record) Item {
+		item.Action, item.Current = ActionReplace, current
+		return item
+	}
+	guarded := protected(zone, want)
 
 	// Already there as wanted: nothing else at the name matters.
 	for _, have := range at {
@@ -224,11 +238,17 @@ func decide(zone Zone, want Record, replace bool, at []Record) Item {
 	}
 	if want.Type == TypeCNAME {
 		if len(others) > 0 {
+			if takeover {
+				return supersede(at)
+			}
 			return conflict(ConflictCNAME, "A CNAME cannot share its name with other records, and this name has some.", others)
 		}
-		return changeOne(item, cnames, protected(zone, want), replace, conflict)
+		return changeOne(item, cnames, guarded, replace, takeover, conflict)
 	}
 	if len(cnames) > 0 {
+		if takeover {
+			return supersede(cnames)
+		}
 		return conflict(ConflictCNAME, "This name is an alias (CNAME), and an alias cannot hold other records.", cnames)
 	}
 
@@ -252,7 +272,7 @@ func decide(zone Zone, want Record, replace bool, at []Record) Item {
 				inFamily = append(inFamily, have)
 			}
 		}
-		return changeOne(item, inFamily, protected(zone, want), replace, conflict)
+		return changeOne(item, inFamily, guarded, replace, takeover, conflict)
 	}
 
 	if len(sameType) == 0 {
@@ -260,29 +280,36 @@ func decide(zone Zone, want Record, replace bool, at []Record) Item {
 		return item
 	}
 	// MX, A, AAAA and the rest hold several values, and adding one to a name
-	// that has others changes where it points. Replacing is only possible when
-	// it is asked for and there is exactly one record to replace.
-	if replace && len(sameType) == 1 {
+	// that has others changes where it points. Changing it is only possible when
+	// it is asked for: by Replace on a protected record with exactly one to
+	// change, or by Takeover, which makes the name this record's alone.
+	if guarded && !replace {
+		return conflict(ConflictApex, "The apex already has a record of this kind with another value. Changing it would change how the whole domain works, so it was left alone.", sameType)
+	}
+	if len(sameType) == 1 && (replace || takeover) {
 		item.Action, item.Current = ActionUpdate, sameType
 		return item
 	}
-	if protected(zone, want) && !replace {
-		return conflict(ConflictApex, "The apex already has a record of this kind with another value. Changing it would change how the whole domain works, so it was left alone.", sameType)
+	if takeover {
+		return supersede(sameType)
 	}
 	return conflict(ConflictOtherRecords, "This name already has records of this type with other data, and they were left alone.", sameType)
 }
 
 // changeOne decides among the existing records of one kind at the name that a
 // wanted record would replace: none is a create, one is an update, and a
-// protected one needs the request to say so.
-func changeOne(item Item, candidates []Record, guarded, replace bool, conflict func(string, string, []Record) Item) Item {
+// protected one needs the request to say so. Several are ambiguous, unless the
+// name is the caller's: then they are all replaced.
+func changeOne(item Item, candidates []Record, guarded, replace, takeover bool, conflict func(string, string, []Record) Item) Item {
 	switch {
 	case len(candidates) == 0:
 		item.Action = ActionCreate
-	case len(candidates) > 1:
+	case len(candidates) > 1 && !takeover:
 		return conflict(ConflictAmbiguous, "More than one record could be the one to change, so none was.", candidates)
 	case guarded && !replace:
 		return conflict(ConflictApex, "The apex already has this record with another value. Changing it would change how the whole domain works, so it was left alone.", candidates)
+	case len(candidates) > 1:
+		item.Action, item.Current = ActionReplace, candidates
 	default:
 		item.Action, item.Current = ActionUpdate, candidates
 	}

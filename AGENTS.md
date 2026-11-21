@@ -73,7 +73,7 @@ tests/Unit     the audit of the manifest and the shape of the library
 
 | A model reaches for | What is here instead |
 | --- | --- |
-| a `Delete` on a provider, "to clean up what we made" | nothing. A provider cannot delete, `TestTheProviderInterfaceCannotDelete` holds it, and a record the customer has is theirs |
+| a `Delete` on `Provider`, "to clean up what we made" | nothing. `Provider` has no `Delete`, `TestTheProviderInterfaceCannotDelete` holds it. Removal is the optional `Remover`, reached only through an `ActionReplace` item of a `Want` with `Takeover` |
 | storing the customer's token to retry later | the caller holds it for one request flow and revokes it. Nothing here stores a credential, and no error text carries one |
 | a `Module`, a route, a table, a `Config` for the whole package | nothing. A caller imports the package it needs |
 | a third-party DNS, Cloudflare or Domain Connect library | the code in this repository, written from the documentation and the specification |
@@ -86,11 +86,15 @@ tests/Unit     the audit of the manifest and the shape of the library
 
 A change that breaks one of them is not merged, whatever else it improves.
 
-1. **Nothing is deleted.** There is no delete in the `Provider` interface and no
-   update that reaches a record at a name the plan did not name.
+1. **Nothing is deleted unless the plan said so, at the name it named.** There is
+   no delete in the `Provider` interface and no update that reaches a record at a
+   name the plan did not name. `Apply` removes records only for an
+   `ActionReplace` item (a `Want` with `Takeover`), only the ones the plan listed
+   at that item's own name, only through `Remover`, and puts them back when the
+   create that follows fails. `Neighbours` only reads.
 2. **The apex is never touched unasked.** MX, SPF and the DMARC policy at the
-   apex change only with `Want.Replace`; otherwise the plan says `Conflict` and
-   `Apply` writes nothing.
+   apex change only with `Want.Replace`, `Takeover` included; otherwise the plan
+   says `Conflict` and `Apply` writes nothing.
 3. **A plan is idempotent and fresh.** Applying twice does nothing the second
    time, and `Apply` refuses with `ErrPlanChanged` when the zone is not what
    was confirmed.

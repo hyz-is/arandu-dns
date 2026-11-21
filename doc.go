@@ -1,5 +1,5 @@
 // Package dns plans and applies the DNS records a service needs on a customer's
-// domain, without ever deleting or rewriting what the customer already has.
+// domain, and touches nothing the customer has that the caller did not ask for.
 //
 // The caller states the records it wants as []Want. Plan reads what a Provider
 // holds at exactly those names and answers what would be created, what would be
@@ -8,9 +8,13 @@
 //
 // The rules a plan follows, and the tests hold:
 //
-//   - A Provider cannot delete. The interface has no such method, so no code
-//     path in this package or in an application using it can.
-//   - Only the names asked for are read or written.
+//   - A Provider cannot delete. The interface has no such method. A record is
+//     removed only through the optional Remover, only by Apply, only for an
+//     item the plan decided as ActionReplace (a Want with Takeover, whose name
+//     another kind of record or other data holds), and only the records the
+//     plan listed at that item's own name. Without Takeover nothing is removed.
+//   - Only the names asked for are read or written. Neighbours is the one
+//     read beyond them, to show what else is there; it writes nothing.
 //   - A record at the zone apex that decides where mail goes or who may send
 //     it (MX, SPF, and the DMARC policy at _dmarc) is never changed unless the
 //     Want says Replace. Without it, a difference is a Conflict for the person

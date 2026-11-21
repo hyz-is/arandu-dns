@@ -10,8 +10,11 @@ type Outcome string
 
 // The outcomes.
 const (
-	OutcomeCreated  Outcome = "created"
-	OutcomeUpdated  Outcome = "updated"
+	OutcomeCreated Outcome = "created"
+	OutcomeUpdated Outcome = "updated"
+	// OutcomeReplaced: the records in the way were removed and the wanted one
+	// created.
+	OutcomeReplaced Outcome = "replaced"
 	OutcomeExists   Outcome = "exists"
 	OutcomeConflict Outcome = "conflict"
 	OutcomeFailed   Outcome = "failed"
@@ -24,6 +27,13 @@ type Result struct {
 	// Record is the record as the provider holds it after a create or an
 	// update, or the one that was already there on Exists.
 	Record Record
+	// Removed are the records a replacement took out, as they were. After a
+	// failed replacement they are what was put back (Restored) or, when that
+	// failed too, what is gone and must be restored by hand.
+	Removed []Record
+	// Restored says the removed records were put back after the wanted one
+	// could not be created.
+	Restored bool
 	// Error is why an item failed. It carries the provider's message and never
 	// a credential.
 	Error string
@@ -43,7 +53,7 @@ type Report struct {
 func (r Report) Succeeded() bool {
 	for _, result := range r.Results {
 		switch result.Outcome {
-		case OutcomeCreated, OutcomeUpdated, OutcomeExists:
+		case OutcomeCreated, OutcomeUpdated, OutcomeReplaced, OutcomeExists:
 		default:
 			return false
 		}
@@ -77,8 +87,10 @@ func (e *PlanChangedError) Unwrap() error { return ErrPlanChanged }
 // It plans again first, because the zone may have changed since the person
 // looked: when the fresh plan is not the confirmed one, nothing is written and
 // the error is a *PlanChangedError carrying the new plan. Otherwise it creates
-// and updates exactly what the plan says, leaves Exists and Conflict items
-// alone and records each outcome.
+// and updates exactly what the plan says, replaces what it says to replace
+// (removing the records the plan listed at that item's own name and creating
+// the wanted one, which needs a provider that is also a Remover), leaves Exists
+// and Conflict items alone and records each outcome.
 //
 // An error from the provider on one item is recorded on that item and the next
 // one is tried, except when the credential is refused, forbidden or rate
@@ -104,6 +116,8 @@ func Apply(ctx context.Context, provider Provider, confirmed Plan) (Report, erro
 			result = create(ctx, provider, fresh.Zone, item)
 		case ActionUpdate:
 			result = update(ctx, provider, fresh.Zone, item)
+		case ActionReplace:
+			result = replace(ctx, provider, fresh.Zone, item)
 		}
 		report.Results = append(report.Results, result)
 		if fatal(result) {
@@ -155,6 +169,52 @@ func update(ctx context.Context, provider Provider, zone Zone, item Item) Result
 		return failed(item, err)
 	}
 	return Result{Item: item, Outcome: OutcomeUpdated, Record: record}
+}
+
+// replace removes the records in the way and creates the wanted one. It removes
+// nothing the plan did not list at the item's own name, and when the wanted
+// record cannot be created it puts back what it removed.
+func replace(ctx context.Context, provider Provider, zone Zone, item Item) Result {
+	remover, ok := provider.(Remover)
+	if !ok {
+		return failed(item, ErrCannotRemove)
+	}
+	for _, target := range item.Current {
+		if canonicalName(target.Name) != item.Want.Name || target.ID == "" {
+			return failed(item, errors.New("dns: refused to remove a record at another name"))
+		}
+	}
+	var removed []Record
+	for _, target := range item.Current {
+		if err := remover.Delete(ctx, zone, target.ID); err != nil {
+			result := failed(item, err)
+			result.Removed = removed
+			result.Restored = restore(ctx, provider, zone, removed)
+			return result
+		}
+		removed = append(removed, target)
+	}
+	record, err := provider.Create(ctx, zone, item.Want)
+	if err != nil {
+		result := failed(item, err)
+		result.Removed = removed
+		result.Restored = restore(ctx, provider, zone, removed)
+		return result
+	}
+	return Result{Item: item, Outcome: OutcomeReplaced, Record: record, Removed: removed}
+}
+
+// restore puts back records a replacement removed. It answers whether every one
+// is back.
+func restore(ctx context.Context, provider Provider, zone Zone, removed []Record) bool {
+	back := len(removed) > 0
+	for _, record := range removed {
+		record.ID = ""
+		if _, err := provider.Create(ctx, zone, record); err != nil && !errors.Is(err, ErrRecordExists) {
+			back = false
+		}
+	}
+	return back
 }
 
 func failed(item Item, err error) Result {

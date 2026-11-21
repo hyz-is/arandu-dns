@@ -34,13 +34,22 @@ filesystem, no process and no migration.
 
 ## The rules a plan keeps
 
-- A `dns.Provider` has no delete. Nothing in this module can remove a record.
-- Only the names asked for are read or written.
+- A `dns.Provider` has no delete. A record is removed only through the optional
+  `dns.Remover`, only by `dns.Apply`, only for an item the plan decided as
+  `replace` (a `Want` with `Takeover: true` whose name another kind of record or
+  other data holds), and only the records the plan listed at that item's name.
+  The plan shows them first; a removal that is followed by a failed create puts
+  them back. Without `Takeover` nothing is ever removed.
+- Only the names asked for are read or written. `dns.Neighbours` reads the
+  records at and under a name that look like another sending service's (an MX
+  or SPF at the name, DKIM keys, return-path aliases) so the person can see
+  them; it writes nothing, and what it lists is never removed.
 - A record at the apex that decides where mail goes or who may send it (MX, SPF,
   and the DMARC policy at `_dmarc`) is never changed unless the `Want` says
   `Replace: true`. Without it, a difference is a `Conflict` the person decides.
 - A CNAME never shares a name; two SPF or DMARC records never appear; an MX
-  never joins MX records that point elsewhere. Each is a `Conflict`.
+  never joins MX records that point elsewhere. Each is a `Conflict`, unless the
+  `Want` says `Takeover`: then the records in the way are replaced.
 - Applying twice does nothing the second time.
 - `dns.Apply` plans again before writing and refuses with `dns.ErrPlanChanged`
   (a `*dns.PlanChangedError` carrying the new plan) if the zone is no longer

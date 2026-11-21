@@ -318,3 +318,75 @@ func TestAPlanThroughTheCloudflareProviderLeavesTheApexAlone(t *testing.T) {
 		}
 	}
 }
+
+func TestDeleteRemovesTheRecordWithThatID(t *testing.T) {
+	t.Parallel()
+	id := "dddddddddddddddddddddddddddddd01"
+	path := "/zones/" + zoneID + "/dns_records/" + id
+	s := newServer(t, map[string]reply{"DELETE " + path: {200, "delete_ok.json"}})
+	if err := s.provider(t).Delete(context.Background(), zone, id); err != nil {
+		t.Fatal(err)
+	}
+	if s.asked[0].method != http.MethodDelete || s.asked[0].path != path || s.asked[0].auth != "Bearer "+secret {
+		t.Errorf("request = %+v", s.asked[0])
+	}
+	if err := s.provider(t).Delete(context.Background(), zone, ""); err == nil {
+		t.Error("a removal with no ID must be refused before any call")
+	}
+	denied := newServer(t, map[string]reply{"DELETE " + path: {403, "error_forbidden.json"}})
+	if err := denied.provider(t).Delete(context.Background(), zone, id); !errors.Is(err, dns.ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+func TestRecordsUnderAsksForTheSuffixAndKeepsOnlyTheLabelsUnderIt(t *testing.T) {
+	t.Parallel()
+	s := newServer(t, map[string]reply{"GET /zones/" + zoneID + "/dns_records": {200, "records_under.json"}})
+	records, err := s.provider(t).RecordsUnder(context.Background(), zone, "updates.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.asked[0].query.Get("name.endswith"); got != "updates.example.com" {
+		t.Errorf("name.endswith = %q", got)
+	}
+	var names []string
+	for _, r := range records {
+		names = append(names, r.Name)
+	}
+	if strings.Join(names, ",") != "send.updates.example.com,resend._domainkey.updates.example.com,updates.example.com" {
+		t.Errorf("names = %v; not-updates.example.com ends in the suffix without being under it", names)
+	}
+}
+
+func TestAReplacementThroughTheCloudflareProviderRemovesThenCreates(t *testing.T) {
+	t.Parallel()
+	id := "dddddddddddddddddddddddddddddd01"
+	base := "/zones/" + zoneID + "/dns_records"
+	s := newServer(t, map[string]reply{
+		"GET " + base:               {200, "records_under.json"},
+		"DELETE " + base + "/" + id: {200, "delete_ok.json"},
+		"POST " + base:              {200, "record_created.json"},
+	})
+	p := s.provider(t)
+	plan, err := dns.NewPlan(context.Background(), p, zone,
+		dns.Want{Type: dns.TypeCNAME, Name: "send.updates", Content: "return.example.net", Takeover: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Items[0].Action != dns.ActionReplace {
+		t.Fatalf("action = %s, want replace", plan.Items[0].Action)
+	}
+	report, err := dns.Apply(context.Background(), p, plan)
+	if err != nil || report.Count(dns.OutcomeReplaced) != 1 {
+		t.Fatalf("report = %+v, err = %v", report.Results, err)
+	}
+	var order []string
+	for _, r := range s.asked {
+		if r.method != http.MethodGet {
+			order = append(order, r.method)
+		}
+	}
+	if strings.Join(order, ",") != "DELETE,POST" {
+		t.Errorf("writes = %v, want the removal before the creation", order)
+	}
+}
