@@ -1,6 +1,6 @@
-module github.com/arandu-io/package-skeleton
+module github.com/hyz-is/arandu-dns
 
-go 1.26.10
+go 1.26.0
 
 require (
 	github.com/arandu-io/framework v0.71.0
