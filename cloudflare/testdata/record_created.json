@@ -1,0 +1,1 @@
+{"result":{"id":"cccccccccccccccccccccccccccccc01","name":"mail.example.com","type":"MX","content":"mx.example.net","priority":10,"proxiable":false,"proxied":false,"ttl":1,"settings":{},"meta":{},"comment":"Created by Meeng.dev","tags":[],"created_on":"2026-11-20T10:00:00.000000Z","modified_on":"2026-11-20T10:00:00.000000Z"},"success":true,"errors":[],"messages":[]}
