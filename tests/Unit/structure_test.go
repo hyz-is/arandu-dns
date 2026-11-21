@@ -6,207 +6,254 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 )
 
-// TestTheApplicationIntegrationHasOneCompositionFile keeps the package's
-// installation surface as explicit as its constructor. A package is composed
-// in bootstrap/app.go; another bootstrap file would be another place a reader
-// has to search to learn what the application contains.
-func TestTheApplicationIntegrationHasOneCompositionFile(t *testing.T) {
-	t.Parallel()
+// allowedModules are the import prefixes outside the standard library that
+// production code may name: this module's own packages, and golang.org/x.
+var allowedModules = []string{"github.com/hyz-is/arandu-dns", "golang.org/x/"}
 
-	root := packageRoot(t)
-	guides := []string{
-		"README.md",
-		".agents/skills/dns-package/SKILL.md",
-	}
-	bootstrapFile := regexp.MustCompile(`bootstrap/[A-Za-z0-9_.-]+\.go`)
+// packages are the library packages, by directory, and the package name each
+// declares. The root package is ".".
+var packages = map[string]string{".": "dns", "cloudflare": "cloudflare", "domainconnect": "domainconnect", "dnstest": "dnstest"}
 
-	for _, guide := range guides {
-		body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(guide)))
-		if err != nil {
-			t.Fatalf("reading %s: %v", guide, err)
-		}
-
-		text := string(body)
-		for _, required := range []string{"bootstrap/app.go", "dns.New(", "WithProviders"} {
-			if !strings.Contains(text, required) {
-				t.Errorf("%s no longer teaches the explicit composition step %q", guide, required)
-			}
-		}
-
-		for _, referenced := range bootstrapFile.FindAllString(text, -1) {
-			if referenced != "bootstrap/app.go" {
-				t.Errorf("%s introduces a second composition file %s", guide, referenced)
-			}
-		}
-	}
+// fuzzTargets are the parsers that must have a fuzz test, by directory.
+var fuzzTargets = map[string][]string{
+	".":             {"FuzzNormalizeContent"},
+	"domainconnect": {"FuzzParseTemplate"},
 }
 
-// TestThePackageHasOneOwnerPerResponsibility freezes the application shapes
-// this package is allowed to introduce, including one Service owner for Model
-// access and no parallel composition abstraction.
-func TestThePackageHasOneOwnerPerResponsibility(t *testing.T) {
+// benchmarked are the directories that must carry a benchmark: the ones that
+// parse, encode or sign. dnstest is a test double.
+var benchmarked = map[string]bool{".": true, "cloudflare": true, "domainconnect": true}
+
+// testless are the directories that may have no test of their own.
+var testless = map[string]bool{"dnstest": true}
+
+// TestThePackageIsALibrary holds the shape of this repository: pure Go
+// libraries that register nothing, own no table and decide no authorization.
+func TestThePackageIsALibrary(t *testing.T) {
 	t.Parallel()
 
 	root := packageRoot(t)
-	forbiddenPaths := []string{
-		"app/Actions",
-		"app/Data",
-		"app/Rules",
-		"app/Support",
-		"bootstrap/providers.go",
-		"routes/api.go",
-		"routes/channels.go",
-		"public/assets/manifest",
-		"public/assets/manifest.json",
-	}
-
-	for _, path := range forbiddenPaths {
-		if _, err := os.Lstat(filepath.Join(root, filepath.FromSlash(path))); err == nil {
-			t.Errorf("refused application path %s exists in the package template", path)
+	for _, path := range []string{
+		"module.go", "model.go", "policy.go", "service.go", "views.go", "config.go",
+		"resources", "migrations", "database", "routes", "app", "bootstrap",
+	} {
+		if _, err := os.Lstat(filepath.Join(root, path)); err == nil {
+			t.Errorf("%s exists; this package registers nothing, owns no table and decides no authorization", path)
 		} else if !os.IsNotExist(err) {
-			t.Errorf("checking refused application path %s: %v", path, err)
+			t.Errorf("checking %s: %v", path, err)
 		}
 	}
 
-	inspectExplicitComposition(t, root)
-	inspectServiceBoundary(t, root)
+	refusedMethods := map[string]string{
+		"Routes": "a route", "Migrations": "a table", "Boot": "a boot step",
+		"Publishes": "a publication", "Authorize": "an authorization decision",
+	}
+	for _, source := range productionGoFiles(t, root) {
+		for _, imported := range source.file.Imports {
+			path, err := strconv.Unquote(imported.Path.Value)
+			if err != nil {
+				t.Errorf("%s has an unreadable import %s", source.path, imported.Path.Value)
+				continue
+			}
+			first, _, _ := strings.Cut(path, "/")
+			if !strings.Contains(first, ".") {
+				continue // the standard library
+			}
+			allowed := false
+			for _, prefix := range allowedModules {
+				if strings.HasPrefix(path, prefix) {
+					allowed = true
+				}
+			}
+			if !allowed {
+				t.Errorf("%s imports %s; production code may import the standard library, golang.org/x and this module", source.path, path)
+			}
+			if strings.Contains(path, "/arandu-io/") {
+				t.Errorf("%s imports %s; an Arandu module imports no framework package", source.path, path)
+			}
+		}
+		ast.Inspect(source.file, func(node ast.Node) bool {
+			switch node := node.(type) {
+			case *ast.TypeSpec:
+				if node.Name.Name == "Module" || strings.HasSuffix(node.Name.Name, "ServiceProvider") {
+					t.Errorf("%s declares %s; there is nothing to register", source.path, node.Name.Name)
+				}
+			case *ast.FuncDecl:
+				if what, refused := refusedMethods[node.Name.Name]; refused && node.Recv != nil {
+					t.Errorf("%s declares %s.%s, which is %s this package does not have",
+						source.path, receiverType(node), node.Name.Name, what)
+				}
+				if node.Recv == nil && node.Name.Name == "init" {
+					t.Errorf("%s declares init; a library does work only when it is called", source.path)
+				}
+			}
+			return true
+		})
+	}
 }
 
-// The spellings of the generic model layer, in halves so this file does not
-// carry them whole. Hesape removed that layer, and an entity written against it
-// does not compile -- but a guide that teaches it does, and so does a comment
-// that a configured copy would read as the way to write the next entity.
-const (
-	genericOpen      = "["
-	genericModel     = "model.Model" + genericOpen
-	genericBuilder   = "model.Builder" + genericOpen
-	genericRows      = "model.Collection" + genericOpen
-	genericFactory   = "Factory" + genericOpen
-	genericNewModel  = "model.NewModel" + genericOpen
-	genericInstance  = "NewInstance" + "("
-	generatedHeading = "// Code generated by aru model:build" + " from model.go. DO NOT EDIT."
-)
-
-// TestThePackageUsesTheGeneratedConcreteModel freezes the package shape promised
-// to every configured copy: the entity embeds the non-generic Model, its table
-// is declared once beside it, the query aru model:build generates is the one way
-// in, the entity keeps a custom block for its own rules, the Service owns the
-// database handle, and CRUD does not grow a Repository layer of its own.
-func TestThePackageUsesTheGeneratedConcreteModel(t *testing.T) {
+// TestEveryPackageIsDocumentedAndTested holds what each package must carry: a
+// package comment, tests, a benchmark where bytes are processed, and a fuzz
+// test for each parser.
+func TestEveryPackageIsDocumentedAndTested(t *testing.T) {
 	t.Parallel()
 
 	root := packageRoot(t)
-	if _, err := os.Lstat(filepath.Join(root, "repository.go")); err == nil {
-		t.Error("repository.go still exists; CRUD belongs to the generated query")
-	} else if !os.IsNotExist(err) {
-		t.Fatalf("checking repository.go: %v", err)
-	}
-
-	wants := map[string][]string{
-		"model.go": {
-			`"github.com/arandu-io/hesape/database/model"`,
-			"type Dns struct {\n\tmodel.Model\n",
-			"var dnsTable = model.NewTable(model.TableSpec{",
-			"ManualKey: true,",
-			"// arandu:begin custom\n",
-			"// arandu:end custom\n",
-		},
-		"DnsQuery.go": {
-			generatedHeading,
-			"func Dnss(db model.DB) *DnsQuery",
-			"type DnsCollection []*Dns",
-		},
-		"service.go": {
-			"db     *data.DB",
-			"func NewDnsService(db *data.DB) *DnsService",
-			"Dnss(s.db).New()",
-			"Dnss(s.db).WhereKey(",
-			") (*Dns, error)",
-			") ([]*Dns, error)",
-		},
-		"module.go": {
-			"NewDnsService(db)",
-		},
-	}
-	for path, required := range wants {
-		body, err := os.ReadFile(filepath.Join(root, path))
+	for name, pkg := range packages {
+		dir := filepath.Join(root, name)
+		doc, err := os.ReadFile(filepath.Join(dir, "doc.go"))
 		if err != nil {
-			t.Fatalf("reading %s: %v", path, err)
+			t.Errorf("%s has no doc.go: %v", name, err)
+		} else if !strings.Contains(string(doc), "// Package "+pkg+" ") {
+			t.Errorf("%s/doc.go does not open with a package comment", name)
 		}
-		for _, want := range required {
-			if !strings.Contains(string(body), want) {
-				t.Errorf("%s does not contain %q", path, want)
+
+		tests := ""
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), "_test.go") {
+				body, err := os.ReadFile(filepath.Join(dir, e.Name()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				tests += string(body)
 			}
 		}
-	}
-
-	// Every Go file, tests included, because a test written against the generic
-	// layer is the example the next test is copied from.
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
+		if tests == "" && testless[name] {
+			continue
 		}
-		if entry.IsDir() && (entry.Name() == ".git" || entry.Name() == "testdata") {
-			return filepath.SkipDir
+		if tests == "" {
+			t.Errorf("%s has no tests", name)
+			continue
 		}
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
-			return nil
-		}
-		body, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		relative, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		for _, stale := range []string{genericModel, genericBuilder, genericRows, genericFactory, genericNewModel, genericInstance} {
-			if strings.Contains(string(body), stale) {
-				t.Errorf("%s still spells the generic model layer %q", filepath.ToSlash(relative), stale)
+		for _, fuzz := range fuzzTargets[name] {
+			if !strings.Contains(tests, "func "+fuzz+"(") {
+				t.Errorf("%s has no fuzz test %s", name, fuzz)
 			}
 		}
-		if relative != "DnsQuery.go" && strings.Contains(string(body), generatedHeading) {
-			t.Errorf("%s carries the heading of the generated query, which only DnsQuery.go may", filepath.ToSlash(relative))
+		if benchmarked[name] && !strings.Contains(tests, "func Benchmark") {
+			t.Errorf("%s has no benchmark", name)
 		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("reading the Go files: %v", err)
 	}
 }
 
-// TestTheGuidesTeachTheGeneratedModelBoundary keeps configured packages from
-// inheriting a retired shape through their local instructions: the CRUD
-// Repository, the configured generic Model, and the handler that loaded the
-// session and mapped errors to statuses by hand.
-func TestTheGuidesTeachTheGeneratedModelBoundary(t *testing.T) {
+// TestNoPackageWritesToTheGlobalState keeps the packages free of mutable
+// package-level state: a variable that is assigned after initialization is a
+// registry, and a library that has one is not safe to share.
+func TestNoPackageWritesToTheGlobalState(t *testing.T) {
+	t.Parallel()
+
+	root := packageRoot(t)
+	for _, source := range productionGoFiles(t, root) {
+		globals := map[string]bool{}
+		for _, decl := range source.file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.VAR {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				for _, name := range spec.(*ast.ValueSpec).Names {
+					globals[name.Name] = true
+				}
+			}
+		}
+		for _, decl := range source.file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				assign, ok := n.(*ast.AssignStmt)
+				if !ok || assign.Tok == token.DEFINE {
+					return true
+				}
+				for _, lhs := range assign.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok && globals[id.Name] && !shadowed(fn, id.Name) {
+						t.Errorf("%s: %s assigns the package variable %s", source.path, fn.Name.Name, id.Name)
+					}
+				}
+				return true
+			})
+		}
+	}
+}
+
+// shadowed reports whether the function declares a local of that name.
+func shadowed(fn *ast.FuncDecl, name string) bool {
+	found := false
+	check := func(fields *ast.FieldList) {
+		if fields == nil {
+			return
+		}
+		for _, f := range fields.List {
+			for _, n := range f.Names {
+				if n.Name == name {
+					found = true
+				}
+			}
+		}
+	}
+	check(fn.Type.Params)
+	check(fn.Type.Results)
+	check(fn.Recv)
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			if n.Tok == token.DEFINE {
+				for _, lhs := range n.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok && id.Name == name {
+						found = true
+					}
+				}
+			}
+		case *ast.ValueSpec:
+			for _, id := range n.Names {
+				if id.Name == name {
+					found = true
+				}
+			}
+		case *ast.RangeStmt:
+			for _, e := range []ast.Expr{n.Key, n.Value} {
+				if id, ok := e.(*ast.Ident); ok && id.Name == name {
+					found = true
+				}
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// TestTheGuidesTeachTheLibrary keeps the documents an installer and a
+// maintainer read in step with the package that exists.
+func TestTheGuidesTeachTheLibrary(t *testing.T) {
 	t.Parallel()
 
 	root := packageRoot(t)
 	guides := map[string][]string{
-		"AGENTS.md":                           {"Dnss(db)", "security.Authorize"},
-		"README.md":                           {"Dnss(db)", "DnsQuery", "aru model:build", "RequireAuth"},
-		"CONTRIBUTING.md":                     {"Dnss(db)", "authorizes before reaching the Model", "aru model:build"},
-		"SECURITY.md":                         {"Model terminal", "data.Tenant(g)"},
-		".agents/skills/README.md":            {"DnsQuery", "custom block"},
-		".agents/skills/dns-module/SKILL.md":  {"dnsTable", "ctx.User()", "RequireAuth", "return err"},
-		".agents/skills/dns-policy/SKILL.md":  {"security.Authorize", "Dnss(s.db).New()"},
-		".agents/skills/dns-release/SKILL.md": {"model:build --check", "configured copy"},
-		".agents/skills/dns-package/SKILL.md": {"RequireAuth", "/auth/login"},
+		"README.md": {"go get github.com/hyz-is/arandu-dns", "arandu-dns/cloudflare", "arandu-dns/domainconnect",
+			"arandu-dns/dnstest", "dns.NewPlan", "dns.Apply", "cloudflare.New", "domainconnect.Client"},
+		"AGENTS.md": {"TestThePackageIsALibrary", "GOWORK=off", "-fuzz", "cloudflare", "domainconnect", "dnstest"},
+		".agents/skills/dns-package/SKILL.md": {"go get github.com/hyz-is/arandu-dns", "dns.NewPlan", "dns.Apply",
+			"cloudflare.OAuth", "domainconnect.Client", "ApplyURL"},
+		".agents/skills/dns-release/SKILL.md": {"FuzzNormalizeContent", "FuzzParseTemplate", "TestTheModuleRequiresOnlyTheStandardLibraryAndX"},
+		".agents/skills/README.md":            {"dns-package", "dns-release", "dns-vault-notes"},
 	}
 	retired := []string{
-		"DnsRepository", "NewDnsRepository", "repository.go  data access",
-		genericModel, genericBuilder, genericInstance,
-		"Model-first", "configured Model",
-		"m.answer(", "m.subject(", "Config.Tenant", "cfg.Auth.Tenant",
+		"dns.New(", "dns.Config{", "DnsService", "DnsPolicy", "Dnss(",
+		"model:build", "vendor:publish", "/auth/login",
 	}
+
 	for path, required := range guides {
 		body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
 		if err != nil {
@@ -220,321 +267,45 @@ func TestTheGuidesTeachTheGeneratedModelBoundary(t *testing.T) {
 		}
 		for _, stale := range retired {
 			if strings.Contains(text, stale) {
-				t.Errorf("%s still teaches the retired shape %q", path, stale)
+				t.Errorf("%s still teaches the template's module through %q", path, stale)
 			}
 		}
 	}
 }
 
-// TestHandlersLeaveTheSubjectAndTheStatusToTheFramework holds the two things a
-// handler of this package no longer does for itself. RequireAuth loads the
-// session and puts the subject on the request, so a handler reads it with
-// ctx.User and nothing in the module loads a session again. The router's action
-// adapter turns an error into its status, so a handler returns the error and
-// neither inspects it nor writes a refusal of its own.
-//
-// It reads module.go as syntax. A handler that reached the session or wrote a
-// status through a helper of another name would pass it, which is why the
-// feature tests also drive the routes with and without a session.
-func TestHandlersLeaveTheSubjectAndTheStatusToTheFramework(t *testing.T) {
+// TestEverySkillIsNamedAfterItsDirectory holds the one line of a skill that a
+// tool reads as data, and which skill an application receives.
+func TestEverySkillIsNamedAfterItsDirectory(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(packageRoot(t), "module.go")
-	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	dir := filepath.Join(packageRoot(t), ".agents", "skills")
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("parsing module.go: %v", err)
+		t.Fatalf("reading the skills: %v", err)
 	}
-
-	methods := map[string]*ast.FuncDecl{}
-	for _, declaration := range file.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if ok && receiverType(function) == "Module" {
-			methods[function.Name.Name] = function
-		}
-	}
-	routes := methods["Routes"]
-	if routes == nil {
-		t.Fatal("Module has no Routes method")
-	}
-
-	// The guard is mounted on the router before the first route is registered
-	// on it, so no route of this package is reachable without a session.
-	guarded, registered := token.NoPos, token.NoPos
-	ast.Inspect(routes.Body, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		switch name := selectorName(call.Fun); {
-		case name == "RequireAuth" && guarded == token.NoPos:
-			guarded = call.Pos()
-		case routeVerbs[name] && registered == token.NoPos:
-			registered = call.Pos()
-		}
-		return true
-	})
-	if guarded == token.NoPos {
-		t.Error("Routes mounts no RequireAuth, so a request with no session reaches the handlers")
-	} else if registered != token.NoPos && guarded > registered {
-		t.Error("Routes registers a route before it mounts RequireAuth")
-	}
-
-	// Nothing in the module loads the session: the guard already did.
-	ast.Inspect(file, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if ok && selectorName(call.Fun) == "Load" {
-			t.Errorf("module.go calls %s, loading the session RequireAuth already loaded; read ctx.User instead",
-				spelled(call.Fun))
-		}
-		return true
-	})
-
-	handlers := registeredHandlers(routes)
-	if len(handlers) == 0 {
-		t.Fatal("Routes registers no Module handler")
-	}
-	for name := range handlers {
-		handler := methods[name]
-		if handler == nil {
-			t.Errorf("Routes registers Module.%s, but no such method exists", name)
+	var found []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
 			continue
 		}
-		readsUser := false
-		ast.Inspect(handler.Body, func(node ast.Node) bool {
-			call, ok := node.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			switch selectorName(call.Fun) {
-			case "User":
-				readsUser = true
-			case "Refuse", "Reject":
-				t.Errorf("Module.%s answers through %s by hand; return the error and let the router answer it",
-					name, spelled(call.Fun))
-			case "Error":
-				if owner, ok := call.Fun.(*ast.SelectorExpr); ok {
-					if pkg, ok := owner.X.(*ast.Ident); ok && (pkg.Name == "http" || pkg.Name == "stdhttp") {
-						t.Errorf("Module.%s writes a status with %s; return the error and let the router answer it",
-							name, spelled(call.Fun))
-					}
-				}
-			case "Is", "As":
-				if owner, ok := call.Fun.(*ast.SelectorExpr); ok {
-					if pkg, ok := owner.X.(*ast.Ident); ok && pkg.Name == "errors" {
-						t.Errorf("Module.%s inspects the error with errors.%s to choose a status; the router does that",
-							name, owner.Sel.Name)
-					}
-				}
-			}
-			return true
-		})
-		if !readsUser {
-			t.Errorf("Module.%s does not read who is asking with ctx.User", name)
-		}
-	}
-}
-
-// routeVerbs are the router methods that register a route, as distinct from the
-// ones that build a group or a middleware chain around it.
-var routeVerbs = map[string]bool{
-	"Action": true, "Resource": true, "Match": true,
-	"Get": true, "Post": true, "Put": true, "Patch": true, "Delete": true,
-}
-
-// spelled is a selector as it is written, for a message.
-func spelled(expression ast.Expr) string {
-	switch expression := expression.(type) {
-	case *ast.SelectorExpr:
-		return spelled(expression.X) + "." + expression.Sel.Name
-	case *ast.Ident:
-		return expression.Name
-	}
-	return "a call"
-}
-
-// inspectExplicitComposition rejects the names that would make registration
-// implicit. AppServiceProvider is the deliberate nominal exception: when it is
-// present it remains a Module, with no Register lifecycle of its own.
-func inspectExplicitComposition(t *testing.T, root string) {
-	t.Helper()
-
-	forbiddenFunctions := map[string]bool{
-		"DiscoverProviders": true,
-		"Providers":         true,
-		"RegisterProvider":  true,
-		"RegisterProviders": true,
-		"ResolveProvider":   true,
-		"ResolveProviders":  true,
-	}
-	appProviderFound := false
-	appProviderMethods := map[string]bool{}
-
-	for _, source := range productionGoFiles(t, root) {
-		compositionAliases := map[string]bool{}
-		for _, imported := range source.file.Imports {
-			path, err := strconv.Unquote(imported.Path.Value)
-			if err != nil {
-				t.Errorf("%s has an unreadable import %s", source.path, imported.Path.Value)
-				continue
-			}
-			if strings.Contains(path, "/container/") || strings.HasSuffix(path, "/container") {
-				t.Errorf("%s imports the container surface %s", source.path, path)
-			}
-			defaultName := ""
-			switch path {
-			case "github.com/arandu-io/framework/foundation", "github.com/arandu-io/hesape/foundation":
-				defaultName = "foundation"
-			case "github.com/arandu-io/framework/kernel":
-				defaultName = "kernel"
-			}
-			if defaultName != "" {
-				name := defaultName
-				if imported.Name != nil {
-					name = imported.Name.Name
-				}
-				if name == "." || name == "_" {
-					t.Errorf("%s hides composition behind the import alias %q", source.path, name)
-					continue
-				}
-				compositionAliases[name] = true
-			}
-		}
-
-		ast.Inspect(source.file, func(node ast.Node) bool {
-			switch node := node.(type) {
-			case *ast.TypeSpec:
-				if node.Name.Name != "Provider" && !strings.HasSuffix(node.Name.Name, "ServiceProvider") {
-					return true
-				}
-				if node.Name.Name == "AppServiceProvider" {
-					appProviderFound = true
-					return true
-				}
-				t.Errorf("%s declares %s, a second composition abstraction", source.path, node.Name.Name)
-			case *ast.FuncDecl:
-				if node.Recv == nil && forbiddenFunctions[node.Name.Name] {
-					t.Errorf("%s declares %s, which makes module registration implicit", source.path, node.Name.Name)
-				}
-				if receiverType(node) == "AppServiceProvider" {
-					appProviderMethods[node.Name.Name] = true
-				}
-			case *ast.SelectorExpr:
-				name, ok := node.X.(*ast.Ident)
-				if ok && compositionAliases[name.Name] && node.Sel.Name == "Provider" {
-					t.Errorf("%s uses a Provider contract instead of Module", source.path)
-				}
-			}
-			return true
-		})
-	}
-
-	if !appProviderFound {
-		return
-	}
-	for _, method := range []string{"Name", "Routes"} {
-		if !appProviderMethods[method] {
-			t.Errorf("AppServiceProvider exists without the Module method %s", method)
-		}
-	}
-	if appProviderMethods["Register"] {
-		t.Error("AppServiceProvider declares a container-style Register lifecycle")
-	}
-}
-
-// inspectServiceBoundary reads the route table rather than fixing a list of
-// handler names in the test. Every handler registered there must call a Service
-// and may not name a Repository directly.
-func inspectServiceBoundary(t *testing.T, root string) {
-	t.Helper()
-
-	path := filepath.Join(root, "module.go")
-	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-	if err != nil {
-		t.Fatalf("parsing module.go: %v", err)
-	}
-
-	serviceFields := map[string]bool{}
-	methods := map[string]*ast.FuncDecl{}
-	var routes *ast.FuncDecl
-
-	for _, declaration := range file.Decls {
-		switch declaration := declaration.(type) {
-		case *ast.GenDecl:
-			for _, specification := range declaration.Specs {
-				typeSpec, ok := specification.(*ast.TypeSpec)
-				if !ok || typeSpec.Name.Name != "Module" {
-					continue
-				}
-				structure, ok := typeSpec.Type.(*ast.StructType)
-				if !ok {
-					t.Fatal("Module is not a struct")
-				}
-				for _, field := range structure.Fields.List {
-					fieldType := namedType(field.Type)
-					if strings.HasSuffix(fieldType, "Repository") {
-						t.Errorf("Module holds %s directly; handlers must reach data through a Service", fieldType)
-					}
-					if !strings.HasSuffix(fieldType, "Service") {
-						continue
-					}
-					for _, name := range field.Names {
-						serviceFields[name.Name] = true
-					}
-				}
-			}
-		case *ast.FuncDecl:
-			if receiverType(declaration) != "Module" {
-				continue
-			}
-			methods[declaration.Name.Name] = declaration
-			if declaration.Name.Name == "Routes" {
-				routes = declaration
-			}
-		}
-	}
-
-	if len(serviceFields) == 0 {
-		t.Fatal("Module has no Service collaborator for use-case orchestration")
-	}
-	if routes == nil {
-		t.Fatal("Module has no Routes method")
-	}
-
-	handlers := registeredHandlers(routes)
-	if len(handlers) == 0 {
-		t.Fatal("Routes registers no Module handler")
-	}
-	for name := range handlers {
-		handler := methods[name]
-		if handler == nil {
-			t.Errorf("Routes registers Module.%s, but no such method exists", name)
+		found = append(found, entry.Name())
+		body, err := os.ReadFile(filepath.Join(dir, entry.Name(), "SKILL.md"))
+		if err != nil {
+			t.Errorf("%s has no SKILL.md: %v", entry.Name(), err)
 			continue
 		}
-
-		usesService := false
-		receiver := receiverName(handler)
-		ast.Inspect(handler.Body, func(node ast.Node) bool {
-			switch node := node.(type) {
-			case *ast.SelectorExpr:
-				field, ok := node.X.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				owner, ownedByModule := field.X.(*ast.Ident)
-				if ownedByModule && owner.Name == receiver && serviceFields[field.Sel.Name] {
-					usesService = true
-				}
-			case *ast.Ident:
-				if strings.HasSuffix(node.Name, "Repository") || strings.EqualFold(node.Name, "repository") ||
-					strings.EqualFold(node.Name, "repo") {
-					t.Errorf("Module.%s reaches %s directly; use the Service boundary", name, node.Name)
-				}
-			}
-			return true
-		})
-		if !usesService {
-			t.Errorf("Module.%s does not delegate its use case to a Service", name)
+		text := string(body)
+		if !strings.HasPrefix(text, "---\nname: "+entry.Name()+"\n") {
+			t.Errorf("%s/SKILL.md does not open with name: %s", entry.Name(), entry.Name())
 		}
+		forApplications := strings.Contains(text, "\nmetadata:\n  audience: app\n")
+		if want := entry.Name() == "dns-package"; forApplications != want {
+			t.Errorf("%s: audience app = %v, want %v", entry.Name(), forApplications, want)
+		}
+	}
+	sort.Strings(found)
+	if strings.Join(found, ",") != "dns-package,dns-release,dns-vault-notes" {
+		t.Errorf("skills = %v, want dns-package, dns-release and dns-vault-notes", found)
 	}
 }
 
@@ -558,10 +329,8 @@ func productionGoFiles(t *testing.T, root string) []parsedGoFile {
 			strings.HasSuffix(entry.Name(), "_test.go") || strings.HasSuffix(entry.Name(), ".kyse.go") {
 			return nil
 		}
-
 		// The comments are kept because a build constraint is one, and a file
 		// the compiler never reads is not part of what this package does.
-		// buildable, in audit_test.go, is what asks.
 		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ParseComments)
 		if err != nil {
 			return err
@@ -577,39 +346,6 @@ func productionGoFiles(t *testing.T, root string) []parsedGoFile {
 		t.Fatalf("reading production Go files: %v", err)
 	}
 	return files
-}
-
-// registeredHandlers is every method of the receiver handed to a call that
-// registers a route. Only those calls: the guard is mounted with a call that
-// takes a field of the receiver too, and a field is not a handler.
-func registeredHandlers(routes *ast.FuncDecl) map[string]bool {
-	handlers := map[string]bool{}
-	receiver := receiverName(routes)
-	ast.Inspect(routes.Body, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok || !routeVerbs[selectorName(call.Fun)] {
-			return true
-		}
-		for _, argument := range call.Args {
-			handler, ok := argument.(*ast.SelectorExpr)
-			if !ok {
-				continue
-			}
-			owner, ok := handler.X.(*ast.Ident)
-			if ok && owner.Name == receiver {
-				handlers[handler.Sel.Name] = true
-			}
-		}
-		return true
-	})
-	return handlers
-}
-
-func receiverName(function *ast.FuncDecl) string {
-	if function.Recv == nil || len(function.Recv.List) == 0 || len(function.Recv.List[0].Names) == 0 {
-		return ""
-	}
-	return function.Recv.List[0].Names[0].Name
 }
 
 func receiverType(function *ast.FuncDecl) string {

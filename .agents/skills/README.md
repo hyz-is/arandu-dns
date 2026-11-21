@@ -15,43 +15,34 @@ names the situation you are in rather than the topic it covers.
 
 | skill | when it fires |
 | --- | --- |
-| `dns-policy` | opening an action, adding an authorized Model-backed use case, or anything answering 403 |
-| `dns-module` | adding a route, a handler, a config field, a response field or a migration |
-| `dns-release` | the gates, the manifest, a dependency, a version, a tag |
+| `dns-release` | the gates, the fuzz runs, the manifest, a dependency, a version, a tag |
 | `dns-vault-notes` | writing the note, the gap or the journal entry, when this checkout sits inside the Arandu Obsidian vault |
-| `dns-package` | installing and wiring this package **into an application** |
+| `dns-package` | configuring the DNS of a customer's domain, with Cloudflare or Domain Connect, **in an application** |
 
-The last one has a different audience from the other three, and that is on
+The template this package started from carried a `-policy` and a `-module`
+skill. Both taught the HTTP module the template ships, and this package removed
+it: there is no policy to open and no route, handler or migration to add.
+
+`dns-package` has a different audience from the other two, and that is on
 purpose: it travels with the package so that an assistant working in somebody
-else's project — the one running `go get` — has the wiring, the migration step
-and the closed policy in front of it instead of guessing.
+else's project, the one running `go get`, has the calls and the mistakes in
+front of it instead of writing a Cloudflare client of its own. Its frontmatter
+says so under `metadata`, with `audience: app`, which is what `aru skills:sync`
+reads to copy the skill into an application whose `go.mod` requires this
+package. No other skill here carries it.
 
-Its frontmatter says so, under `metadata`, with `audience: app`. That line is
-what `aru skills:sync` reads to copy the skill into an application whose
-`go.mod` requires this package, and no other skill here carries it: an
-application that received the release procedure would follow it.
-
-`dns-vault-notes` fires on a condition rather than on a task: it applies
-only when `MOC-arandu.md`, `plans/cmd/audit-vault/` and `45-modules/` are actually
-beside this checkout. Outside the vault it is inert, and it says so first, so a
-package cloned somewhere else never grows a folder tree imitating one.
+`dns-vault-notes` fires on a condition rather than on a task: it applies only
+when `MOC-arandu.md`, `plans/cmd/audit-vault/` and `45-modules/` are actually
+beside this checkout. Outside the vault it is inert, and it says so first.
 
 ## Why these exist
 
-The audience of the first three is somebody changing the package. The common
-failure modes are a provider, a container lookup, a hand edit to the generated
-`DnsQuery.go`, a rule of the entity written into the Service instead of the
-custom block of `model.go`, a handler that loads the session or maps an error to
-a status itself, a CRUD Repository beside the Model, a tenant read from the URL,
-or a Policy branch that returns nil for administrators "for now". None belongs
-here, and the last three are security failures rather than style disagreements.
-
-The package is built to be checked rather than trusted. Its denial tests use a
-nil database, so reaching even the generated query constructor before
-authorization panics. The structural twin reads every exported Service method
-and checks the same order on the allowed path, and reads every handler for the
-subject and the status it must leave to the framework. Running
-`go test -race ./...` exercises all of it.
+The common failure modes when changing this package are a delete added "to
+undo" what a plan made, an update that reaches a record the customer owns, a
+token stored to retry later, a redirect followed with the credential in the
+headers, an address from the customer's DNS called without checking it, and a
+capability added without the manifest saying so. None belongs here, and each is
+held by a test.
 
 ## Adding your own
 

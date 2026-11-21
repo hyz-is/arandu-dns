@@ -1,6 +1,6 @@
 ---
 name: dns-package
-description: Install, wire and use the Arandu DNS package (Go, Arandu) in an application. Use when the request is to "install Arandu DNS", "add dns to the app", "go get github.com/hyz-is/arandu-dns", "wire it into bootstrap/app.go", "register the module", "use the dns routes", "everything under /dns returns 403", "403 forbidden from dns", "it redirects to /auth/login", "the table does not exist", "no such table", "change where it is mounted", "let admins read it", or when a project's go.mod already requires github.com/hyz-is/arandu-dns. Covers the wiring and where each part goes, publishing and linking the views, the Config fields, none of them required, the routes, their names and the session they need, why the policy refuses everything until somebody opens it, and the migration step that is not optional.
+description: Configure the DNS of a customer's domain from an Arandu application with Arandu DNS (Go), instead of writing a Cloudflare client or a Domain Connect flow of its own. Use when the request is to "configure the DNS automatically", "create the records for the customer", "connect the domain like Resend does", "Cloudflare token", "sign in with Cloudflare", "OAuth with Cloudflare", "Domain Connect", "GoDaddy or IONOS auto setup", "plan the DNS changes", "the customer already has an SPF or MX record", "go get github.com/hyz-is/arandu-dns", or when a project's go.mod already requires github.com/hyz-is/arandu-dns. Covers the plan, confirm and apply flow, the two Cloudflare credentials and their exact permissions, the Domain Connect flow and its signed address, the rules that keep a customer's records safe, and the mistakes that leak a token or overwrite a record.
 license: MIT
 metadata:
   audience: app
@@ -8,207 +8,90 @@ metadata:
 
 # Using Arandu DNS
 
-An Arandu package with one entity, its own table, its own routes and its own
-policy. It is registered by hand — there is no service provider, no container
-and no discovery, so if a line is not written in the application, it does not
-happen.
-
-## Install
+Pure Go libraries. There is nothing to register in `bootstrap/app.go`, no
+`aru migrate` and no service to construct for the package as a whole: import the
+package and call it. The application owns what the package does not: **who may
+configure a domain** (its Policy, `security.Authorize`, the Grant and the tenant
+from `data.Tenant(g)`), the **activity log** of each configuration, and where a
+confirmed plan waits between two requests.
 
 ```bash
 go get github.com/hyz-is/arandu-dns
 ```
 
-## The wiring, and where each part goes
+Never `replace` it to a local checkout.
 
-All of it is in `bootstrap/app.go`. `aru make:module` does not edit this file for
-you, and the views the package carries have to be published and linked, below.
+## The flow
 
-The import, with the other module imports:
+1. The person picks a way to authorize: Cloudflare with a token, Cloudflare with
+   OAuth, or the provider Domain Connect found.
+2. The application builds a `dns.Provider` from the credential, finds the zone
+   with `dns.FindZone`, and makes the plan with `dns.NewPlan` from the records
+   the domain needs as `[]dns.Want`.
+3. It shows the plan: each item is `create`, `update`, `exists` or `conflict`,
+   with `Current` (what is there now) and, for a conflict, a `Code` to translate
+   (`cname_exclusive`, `other_records`, `apex_protected`, `ambiguous`).
+4. The person confirms. The application calls `dns.Apply(ctx, provider, plan)`.
+   `errors.As(err, &changed)` for `*dns.PlanChangedError` means the zone moved on:
+   show `changed.Fresh` and ask again.
+5. It records the result in the activity log, revokes the credential and drops it.
 
-```go
-import (
-	dns "github.com/hyz-is/arandu-dns"
-)
-```
+## Rules that are not negotiable
 
-The construction, in `App`, once `NewAppServiceProvider` has returned. `New`
-refuses a wiring that cannot work and `Configure` has no way to return that
-error, so the module is built where the error can leave. The database and the
-session store are the ones the framework built from the configuration:
+- **Never delete, never overwrite what was not asked.** The `Provider` has no
+  delete. Do not add one to a provider of your own.
+- **The apex is the customer's.** MX, SPF and the DMARC policy at the apex are
+  `Conflict`s. `Want.Replace` is only for a person who read the conflict and
+  chose to replace; never set it for them.
+- **The credential is held for one flow.** Hold it server-side, encrypted, with a
+  short expiry bound to the person and the domain, and delete it after use. Never
+  put it in a log, an error shown to the person, the activity log, a URL or a
+  hidden form field that is stored.
+- **A pasted token is checked by use.** `cloudflare.New` refuses an empty token
+  or one with spaces; `dns.ErrUnauthorized` and `dns.ErrForbidden` say which
+  message to show.
 
-```go
-	dnsModule, err := dns.New(dns.Config{}, drivers.DB, drivers.Sessions)
-	if err != nil {
-		_ = drivers.Close()
-		return nil, err
-	}
-```
+## Cloudflare
 
-And the registration, in the `WithProviders(...)` chain the builder is made of:
-
-```go
-	return Configure(cfg, drivers, app).
-		WithProviders(dnsModule).
-		WithVersion(version, commit).
-		Create()
-```
-
-`New` returns an error rather than starting half-wired. It refuses a
-configuration that cannot work, a nil database handle and a nil session store,
-so a wiring mistake costs one restart instead of arriving as a nil dereference
-on the first request that needed it.
-
-## Then publish and link the views
-
-The package carries the markup of its own pages and hands it over, and it
-refuses to boot until the project has linked it. Publish them, then compile them:
-
-```bash
-aru vendor:publish --tag=view
-aru vendor:publish --tag=view --apply
-aru view:build
-```
-
-The first line only previews; nothing is written without `--apply`. The files
-land under `resources/views/modules/dns/` and are the project's from
-then on. `aru view:build` compiles them, and the compiled package is imported
-with the other blank imports of `bootstrap/app.go`:
-
-```go
-	_ "your/module/path/storage/framework/views/modules/dns"
-```
-
-**Symptom to recognise:** the application stops at boot with an error naming the
-view, the command and the import. One of the steps is missing, and the import
-is the usual one.
-
-## Then run the migrations
-
-```bash
-aru migrate
-```
-
-Not optional, and not automatic. The package owns a table, which is why its
-`arandu.mod.toml` declares `migrations = true` — that declaration is how an
-installer finds out before deploying rather than from the first request.
-
-`aru migrate` is a step in the pipeline and never a call at the start of the
-process: with N replicas, N migrations race each other.
-
-**Symptom to recognise:** `no such table`, or `relation does not exist`, from a
-route that authorized correctly. The migration has not run.
-
-## Configuration
-
-| field | required | meaning |
-| --- | --- | --- |
-| `Prefix` | no | where the routes are mounted. Defaults to `/dns` |
-| `PageSize` | no | how many records one page answers with. Defaults to 25, refused above 200 |
-
-`dns.Config{}` is a complete configuration. There is no tenant to pass:
-every route needs a session, and the tenant of every statement comes from
-`data.Tenant(g)`, off the Grant of whoever is signed in. Passing a value the
-request named — a path segment, a header, a subdomain read off the URL — is what
-`TestNoTenantIsReadOutOfTheRequest` fails on in the package. In an application
-the same mistake is `aru doctor`'s `tenant-from-request`; in a package nothing
-but the package's own suite looks.
-
-`PageSize` above 200 is an error from `New`, not a silent 200. A number somebody
-wrote and did not get is worse than a number somebody wrote and was told about.
-
-## Routes
-
-| method | path | name |
-| --- | --- | --- |
-| `GET` | `/dns` | `dns.index` |
-| `GET` | `/dns/{id}` | `dns.show` |
-| `POST` | `/dns` | `dns.store` |
-
-Every route sits behind `RequireAuth`, mounted by the package itself. A request
-with no session is sent to `/auth/login` — 303, or `YPY-Redirect` for a YPY
-request — and comes back to the address it asked for after signing in. That is
-the sign-in screen the starter kit publishes; an application without one sees
-a 404 there.
-
-**Symptom to recognise:** every route of the package redirects to
-`/auth/login`. Nobody is signed in on that request: the session cookie did not
-arrive, or the session store passed to `New` is not the one the application
-signs people in with.
-
-Build URLs from the names, never by writing the path a second time. `aru
-route:list` shows them grouped by module. Under a custom `Prefix` the paths move
-and the names do not.
-
-`GET /dns` answers `{"data": {"items": [...]}}`, and adds
-`"next_cursor"` beside `data` when a further page exists. Pass it back as
-`?cursor=`. A page shorter than `PageSize` is the last one and carries no
-cursor.
-
-`TenantID` is not in any response. That is deliberate: it names a customer's
-identifier and the response is a declared list of fields rather than the entity.
-
-## Every route refuses everybody, until you open the policy
-
-This is the state the package ships in, and it is not a bug to work around.
-`DnsPolicy` denies every action and has no branch that allows one:
-
-```
-403 Forbidden
-```
-
-is what a correctly installed, correctly migrated, correctly wired package
-answers to an administrator who is signed in, on day one.
-
-Opening an action means writing the rule that opens it, in the package's
-`policy.go`, inside the block that says so:
-
-```go
-	// arandu:begin custom
-	if a == DnsView && (s.ID == record.ID || s.HasRole("admin")) {
-		return nil
-	}
-	// arandu:end custom
-```
-
-What is not written there stays closed, including every action added later.
-There are five actions — `DnsView`, `DnsList`, `DnsCreate`,
-`DnsUpdate`, `DnsDelete` — and opening one opens exactly one.
-
-**Do not open it from the application.** There is no hook, no override and no
-config flag for the policy, and adding one would be a second place where
-authorization is decided. If the rules this application needs are not the rules
-the package ships, the change belongs in the package.
-
-## What the answers mean
-
-| status | what happened |
+| credential | how |
 | --- | --- |
-| `303` to `/auth/login` | there is no session on the request |
-| `403` | the policy refused, or no rule allows the action yet |
-| `404` | no row with that id in this tenant |
-| `303` back to the page the request came from | the input was rejected; the messages and what was typed are in the flash |
-| `422` `application/problem+json` | the input was rejected and the request asked for JSON; the messages are in `errors`, keyed by field |
+| a pasted API token | `cloudflare.New(token)`; the token has two permissions, both on the one zone: Zone, Zone, Read and Zone, DNS, Edit |
+| OAuth | `cloudflare.OAuth{ClientID, ClientSecret, RedirectURI}`: `NewPKCE`, `Random`, `AuthorizationURL`, then `Exchange` on the callback after checking the state, and `Revoke` when done; scopes `zone.read dns.write` |
 
-A request that asks for JSON (an `Accept` naming `application/json`, or an XHR
-that is not a YPY request) gets the 403 and the 404 as problem documents too. The
-sign-in redirect is the same for every client.
+```go
+provider, err := cloudflare.New(token)
+zone, err := dns.FindZone(ctx, provider, domain)
+plan, err := dns.NewPlan(ctx, provider, zone, wants...)
+report, err := dns.Apply(ctx, provider, plan)
+```
 
-The package does not choose these: its handlers return what the service
-returned, and the framework's router answers it. A refusal carries no detail
-beyond the status and its standard sentence. Telling a client why a policy said
-no tells it what exists and what does not, one request at a time. The reason is
-in the log.
+## Domain Connect
 
-Anything else is a 500 and the framework's error page in development. The
-package returns unexpected errors rather than swallowing them, so a route that
-answers 200 with an empty body is not something it does.
+```go
+client := domainconnect.Client{}
+found, err := client.Discover(ctx, domain)               // ErrUnsupported: show the manual records
+ok, err := client.Supports(ctx, found, providerID, serviceID) // false: the provider has not onboarded the template
+address, err := found.ApplyURL(domainconnect.Request{...}, signer)
+```
 
-## Reporting a problem
+Show `found.Settings.DisplayName()` and `found.SyncHost()` before redirecting;
+the address comes from the customer's DNS. After the redirect back, **do not
+trust it as proof**: verify the records by DNS. `domainconnect.ParseTemplate`,
+`Validate` and `Expand` let a test prove the template creates the records the
+application expects.
 
-Issues and pull requests go to the repository the module path names,
-`github.com/hyz-is/arandu-dns`, which belongs to `hyz-is`. A vulnerability goes to the
-private advisory form named in that repository's `SECURITY.md`, and never into
-an issue.
+## Tests
 
-MIT licensed. Copyright Paulo R. Lima.
+Use `dnstest.New(zone)`: `Seed` puts records in the zone, `Holds` reads them,
+`Calls` and `Writes` prove what a flow did. Do not call Cloudflare from a test.
+
+## Mistakes that cost somebody something
+
+| the mistake | what happens |
+| --- | --- |
+| applying a plan from a stale page without `dns.Apply` | `Apply` plans again; calling the provider directly skips that |
+| turning a `conflict` into an `update` by setting `Replace` for the person | their MX or SPF is replaced and their mail stops |
+| keeping the token to "retry later" | a customer's credential sits in a database |
+| following a redirect with `http.Client` defaults on the Cloudflare call | the credential is sent where the redirect points |
+| calling the address in the customer's `_domainconnect` record with a default client | the server is made to call its own network |
+| adding the DMARC or SPF record as a plain `Want` without checking the plan | two SPF records break SPF; the plan reports the conflict, read it |

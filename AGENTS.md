@@ -1,12 +1,16 @@
 # Working on Arandu DNS
 
-This is an Arandu package: one entity with an embedded Hesape Model, one policy
-that decides about it, one service that owns the database handle, and the routes
-that reach them.
-It is a Go module somebody `go get`s and registers by hand in their own
-`bootstrap/app.go`, which is the whole difference from working in an
-application. There is no service provider, no container and no discovery — if a
-line of wiring is not written in the installer's repository, it does not happen.
+This is an Arandu package made of pure Go libraries that configure the DNS of a
+customer's domain for a service: the plan of the records to create, change or
+leave (`dns`), the Cloudflare provider and its OAuth client (`cloudflare`), the
+Domain Connect protocol (`domainconnect`) and a provider for tests (`dnstest`).
+It is a Go module somebody `go get`s and imports.
+
+It began as the package skeleton, configured as `hyz-is/dns`, and the HTTP
+module the template ships was removed on purpose: there is no entity, no table,
+no migration, no policy, no route, no view and no `Module` to register. Nothing
+here should grow back into one. Who may configure a domain is the application's
+Policy and Grant; what was configured is the application's activity log.
 
 Read `.agents/skills/` before writing code. Each skill is a procedure, and the
 one you need is named by the situation you are in.
@@ -23,158 +27,101 @@ go vet ./...
 go test -race ./...
 ```
 
-`GOWORK=off` is not borrowed from somewhere else, and here it is not a
-preference either. This checkout may sit beside a Go workspace that lists the
-framework repositories and does not list this one; when it does, every command
-above fails before it compiles anything:
+`GOWORK=off` is not a preference. This checkout may sit beside a Go workspace
+that lists the framework repositories and does not list this one; when it does,
+every command above fails before it compiles anything:
 
 ```
 pattern ./...: directory prefix . does not contain modules listed in go.work
 or their selected dependencies
 ```
 
-With the workspace off, the module resolves the framework version in `go.mod` —
-which is what CI compiles against, and what somebody's `go get` will get.
+Before a release, give each parser a longer fuzz run. The seeds and the inputs
+that once found a defect run on every `go test`; the run is what looks past
+them:
 
-Both filters on `gofmt` are load-bearing in the toolchain even where this
-repository has nothing for them to skip: `gofmt` is the only tool in the chain
-that ignores build tags, and `testdata/` is where a fixture is allowed to be
-invalid on purpose.
-
-`aru doctor` is not one of the gates, and running it here costs a minute and
-answers nothing:
-
-```
-this is not an Arandu project: no go.mod, main.go and arandu.toml together.
-Run it from inside a project, or create one with `aru new`
+```sh
+go test . -run='^$' -fuzz='^FuzzNormalizeContent$' -fuzztime=60s
+go test ./domainconnect -run='^$' -fuzz='^FuzzParseTemplate$' -fuzztime=60s
 ```
 
-It exits 1. It reads applications, and this is a library.
+A fuzz failure writes its input under `testdata/fuzz/<Target>/`. Commit that
+file with the fix: it is the regression test.
 
-It does not read this one after it is installed either, and that is why
-`tests/Unit/audit_test.go` exists. The doctor walks the application's own tree,
-skips `vendor/`, and opens the one `arandu.mod.toml` at its root; it never loads
-a dependency. So `tenant-from-request`, `system-grant-without-tenant` and
-`permission-not-declared` never see a line of an installed package, and whatever
-this one must prove about itself it proves in its own suite or nowhere.
+`aru doctor` is not one of the gates. It reads applications, and exits 1 here.
+It does not read this package after it is installed either, which is why
+`tests/Unit/audit_test.go` compares `arandu.mod.toml` with what the code calls.
 
 ## What this repository holds
 
 | | measured with |
 | --- | --- |
-| 7 Go files, one per role and one generated, all in one package at the root | `grep -l '^package dns' *.go` |
-| 6 test files, 44 tests | `find tests -name '*_test.go'` · `go test -count=1 ./... -v \| grep -c '^--- PASS'` |
-| 3 routes | `grep -c 'r.Action' module.go` |
-| 5 actions the policy answers about | `grep -cE '^\t[A-Za-z]+ security.Action = ' policy.go` |
-| 2 direct dependencies, both under `arandu-io` | `go list -m -f '{{if and (not .Indirect) (not .Main)}}{{.Path}} {{.Version}}{{end}}' all` |
-
-The layout is by role rather than by layer, so the package reads top to bottom:
+| 4 packages, the root `dns`, `cloudflare`, `domainconnect` and `dnstest` | `ls -d */` |
+| 0 routes, 0 tables, 1 capability (`network`) | `arandu.mod.toml`, `TestThePackageIsALibrary` |
+| 0 dependencies outside the standard library | `go list -m all` |
+| a fuzz test for each parser, a benchmark for each package that encodes or signs | `tests/Unit/structure_test.go` |
 
 ```
-module.go         registration, routes, handlers and migrations
-config.go         what the application passes in
-model.go          the entity, its table, its own rules, and what it may answer with
-DnsQuery.go  the query on that table, generated by aru model:build
-policy.go         who may do what
-service.go        validation, authorization and persistence with the Grant
-views.go          the files the application takes ownership of
+(root)         types.go normalize.go plan.go apply.go      the model, the plan, the application
+cloudflare/    provider.go oauth.go                        the API and the OAuth client
+domainconnect/ discover.go safe.go sign.go apply.go template.go
+dnstest/       fake.go                                     a provider in memory
+tests/Unit     the audit of the manifest and the shape of the library
 ```
 
-`dnsTable`, in `model.go`, declares the table once: its name, the
-`ManualKey` that says the text primary key is written by the application, and
-the default `tenant_id` scope. `Dnss(db)` is generated from it into
-`DnsQuery.go` and returns the concrete `*DnsQuery`; that file is never
-edited by hand, and `aru model:build --check` says when it is stale. Its
-terminals return `*Dns` and `DnsCollection`; keep those pointers
-intact, because copying an embedded Model leaves its `Entity` pointer aimed at
-the original allocation.
-
-The rules of the entity itself (invariants, derived values, transitions that
-change only its own fields) live in the custom block of `model.go`, and they
-are pure. The service holds none of them: it validates the request, asks the
-policy for a Grant, calls those rules and saves with the Grant. `Resource` and
-`Collection` are the deliberate response snapshot boundary.
-
-## What does not exist here
-
-Reaching for one of these is the most common way to write a package that is
-rejected in review. None of them is missing by accident.
+## What does not exist here, on purpose
 
 | A model reaches for | What is here instead |
 | --- | --- |
-| a service provider, a container, a `Register()` that discovers things | `New(cfg, db, sessions)`, called by hand in the installer's `bootstrap/app.go`. Everything the package touches is a parameter |
-| a global `DB`, an `init()` that opens a connection | the `*data.DB` handed to `New`. A package that opened its own connection would be a package the application cannot point at a test database |
-| a CRUD Repository beside the Model | `Dnss(db)`, reached only by `DnsService` after `security.Authorize` |
-| a tenant read from the path, the body, the query or a header | `data.Tenant(g)`, from the Grant, which came from the session |
-| a permit-all branch in the policy "for now" | nothing. The policy denies, and an action is opened by writing the rule that opens it |
-| an `interface{}` config, a map of options, an env var read at call time | the typed `Config` struct, validated by `New` |
-| a `panic` on bad wiring | an `error` from `New`. A wiring mistake found at boot costs one restart |
-| a third dependency | an argument, first. This module is imported into other people's builds |
-| a command of its own that copies files into a project | `Publishes()`, which declares a tagged tree and nothing more. `aru vendor:publish` asks the application which modules it registered and writes what each one declares, so one command serves every installed package instead of one command per package |
+| a `Delete` on a provider, "to clean up what we made" | nothing. A provider cannot delete, `TestTheProviderInterfaceCannotDelete` holds it, and a record the customer has is theirs |
+| storing the customer's token to retry later | the caller holds it for one request flow and revokes it. Nothing here stores a credential, and no error text carries one |
+| a `Module`, a route, a table, a `Config` for the whole package | nothing. A caller imports the package it needs |
+| a third-party DNS, Cloudflare or Domain Connect library | the code in this repository, written from the documentation and the specification |
+| `http.Get` or the default client | the `HTTPClient` interfaces; the Cloudflare one never follows a redirect, the Domain Connect one refuses internal addresses |
+| `init` that registers a provider, or a package variable assigned later | values built by `New...` and passed explicitly |
+| merging an SPF record with what the customer has | a `Conflict`. Merging is a decision about their mail, and it is theirs |
+| a real customer's domain, key or token in a test | `example.com`, `example.net`, and recorded response shapes with invented values |
 
-## The four properties
+## The properties
 
-These are the reason the package is shaped the way it is. A change that breaks
-one of them is not merged, whatever else it improves. `tests/Unit/policy_test.go`
-checks all four against the code.
+A change that breaks one of them is not merged, whatever else it improves.
 
-1. **The policy denies by default**, and has no branch that allows an action.
-   `TestThePolicyDeniesEveryActionByDefault` walks every action with an
-   administrator subject and requires
-   `security.ErrForbidden` from each.
-2. **Every Service method authorizes before it reaches the Model.**
-   `TestEveryServiceMethodAuthorizesBeforeTheModel` checks the source, and
-   `TestTheServiceRefusesBeforeReachingTheModel` gives the Service a nil handle
-   so even constructing `Dnss` in the wrong order fails.
-3. **The tenant comes from `data.Tenant(g)`**, on every path, read and write.
-   `TestTheTenantComesFromTheGrant` and
-   `TestTheServiceWritesTenantOnlyFromTheGrant` hold both halves.
-4. **Nothing reaches the Model without passing the first two.** The denial
-   suite constructs the Service with a nil database, so a call to
-   `Dnss(nil)` would panic. Every refusal it asserts is therefore proof
-   that authorization happened before Model construction.
-
-`policy_test.go` holds those four by calling the code. `tests/Unit/audit_test.go`
-holds the same shape by *reading* it: every exported Service method must call
-`Authorize` before its first `Dnss`, every tenant write in the Service
-comes from `data.Tenant(g)`, and no tenant accessor reads request input.
-
-It also compares `arandu.mod.toml` against what the code *calls* —
-`os.WriteFile`, `exec.Command`, `http.Get`, a method named `Migrations` — rather
-than against what it imports, because `net/http` is imported by everything with
-a route and says nothing. Both directions fail: used and not declared, which is
-`permission-not-declared` where the doctor runs it, and declared and not used,
-which is a warning there and a failure here because `go test` has one outcome.
-Adding an outbound call, a file write or a process means declaring it in the
-same commit, and the suite is what says so.
-
-The fifth property is not syntax, so it is held where the routes exist.
-`TestNoRouteLandsInTheFrameworkNamespace`, in `tests/Feature/routes_test.go`,
-registers the module and reads the table back: a prefix arrives through
-configuration, and `/_arandu/` is refused when the application boots — in the
-installer's process, after publication.
-
-What the audit does not reach is written at the top of the file it lives in. It
-reads syntax, so dynamic dispatch, reflection, and wrappers around the named
-seams are invisible to it. A green run means no such thing was found written
-down, not that none exists.
+1. **Nothing is deleted.** There is no delete in the `Provider` interface and no
+   update that reaches a record at a name the plan did not name.
+2. **The apex is never touched unasked.** MX, SPF and the DMARC policy at the
+   apex change only with `Want.Replace`; otherwise the plan says `Conflict` and
+   `Apply` writes nothing.
+3. **A plan is idempotent and fresh.** Applying twice does nothing the second
+   time, and `Apply` refuses with `ErrPlanChanged` when the zone is not what
+   was confirmed.
+4. **No credential leaks.** An error carries the provider's messages and never
+   the token or the client secret; the Cloudflare client never follows a
+   redirect; an OAuth authorization URL carries PKCE and no secret.
+5. **The customer's DNS is untrusted input.** Discovery calls only https names,
+   never a port, an IP literal or an internal address, and reads bounded bodies.
+6. **`arandu.mod.toml` matches the code.** `network` is true; the other three
+   are false, and `tests/Unit/audit_test.go` compares them with what the code
+   calls.
 
 ## Writing code
 
 Everything in the source is in English: identifiers, doc comments, internal
-comments, error messages, log messages, and the names and messages of tests.
-`pkg.go.dev` publishes the doc comments and its readers are users of this
-package.
+comments, error messages, and the names and messages of tests.
 
 Every exported symbol carries a doc comment, and the comment documents the
-symbol and nothing else. Why a signature is what it is belongs there when it is
-a fact about the code — *"the value is held because Go does not build a type
-from a string"* stays. A date, an issue number, a version in progress or the
-name of another repository does not.
+symbol and nothing else.
 
-Tests go under `tests/`, in a capitalized category directory declaring a
-lowercase external package: `tests/Unit` holds `package unit_test`,
-`tests/Feature` holds `package feature_test`. Both import the package by its
-module path, which is what makes them see exactly what a caller sees. A test
-that genuinely needs something unexported goes beside the code as
-`*_internal_test.go`, and the suffix is how it says so.
+A new DNS host is a new package beside `cloudflare` that implements
+`dns.Provider` and is tested against recorded responses. A new protocol for
+configuring DNS without a credential goes beside `domainconnect`.
+
+## Commits
+
+One commit per logical change, in English, saying what changed and why. The
+identity is `HYZIS <admin@hyz.is>` and is set in this repository's own git
+config. Never any AI attribution. `core.hooksPath` points at
+`/Users/paulorlima9/Developer/arandu-io/.githooks`.
+
+Push, tags and releases are made when the owner has authorized them. The
+repository was created from `arandu-io/package-skeleton` in the `hyz-is`
+organization, and the work is on top of its first commit.
