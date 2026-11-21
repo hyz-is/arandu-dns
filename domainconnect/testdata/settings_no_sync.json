@@ -1,0 +1,6 @@
+{
+    "providerId": "asyncprovider.example",
+    "providerName": "Async Provider",
+    "urlAsyncUX": "https://connect.asyncprovider.example",
+    "urlAPI": "https://api.asyncprovider.example"
+}

@@ -1,0 +1,17 @@
+{
+  "providerId": "example.com",
+  "providerName": "Example Mail",
+  "serviceId": "sending",
+  "serviceName": "Sending e-mail with Example Mail",
+  "version": 1,
+  "logoUrl": "https://example.com/logo.svg",
+  "description": "Publishes the records a domain needs to send mail through Example Mail.",
+  "variableDescription": "dkim is the public key of the domain, without the p= tag.",
+  "syncPubKeyDomain": "example.com",
+  "syncRedirectDomain": "example.com",
+  "records": [
+    {"type": "MX", "groupId": "mail", "host": "mail", "pointsTo": "mx.example.net", "priority": 10, "ttl": 3600},
+    {"type": "SPFM", "groupId": "mail", "host": "mail", "spfRules": "include:spf.example.net"},
+    {"type": "TXT", "groupId": "mail", "host": "ex._domainkey", "data": "p=%dkim%", "ttl": 3600, "txtConflictMatchingMode": "None"}
+  ]
+}

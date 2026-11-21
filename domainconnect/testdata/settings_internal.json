@@ -1,0 +1,6 @@
+{
+    "providerId": "provider.example",
+    "providerName": "Provider",
+    "urlSyncUX": "https://connect.provider.example",
+    "urlAPI": "https://169.254.169.254/latest"
+}
